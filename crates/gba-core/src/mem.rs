@@ -155,6 +155,8 @@ pub struct MemMap {
     /// Set when a frame completes (start of VBlank); cleared by the runner.
     pub frame_ready: bool,
     pub frames: u64,
+    #[cfg(feature = "perf-counters")]
+    pub perf_counters: GbaPerfCounters,
 
     /// 240×160 RGB555 output, written per scanline by the PPU.
     pub framebuffer: Vec<u16>,
@@ -226,6 +228,20 @@ pub struct MemMap {
     audio_cursor: u64,
     apu: crate::apu::Apu,
     next_event: u64,
+}
+
+/// Métricas acumuladas de tiempo y volumen de operaciones de hardware GBA.
+#[cfg(feature = "perf-counters")]
+#[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GbaPerfCounters {
+    /// Tiempo acumulado en nanosegundos ejecutando la PPU (`render_scanline`).
+    pub ppu_ns: u64,
+    /// Tiempo acumulado en nanosegundos avanzando el APU (`pump_audio`).
+    pub apu_ns: u64,
+    /// Total de accesos de lectura a memoria (read8, read16, read32).
+    pub reads: u64,
+    /// Total de accesos de escritura a memoria (write8, write16, write32).
+    pub writes: u64,
 }
 
 /// 65536 Hz on the 16.78 MHz master clock — the PWM grid most games
@@ -307,7 +323,15 @@ impl MemMap {
             audio_cursor: 0,
             apu: crate::apu::Apu::default(),
             next_event: HBLANK_FLAG_CYCLE,
+            #[cfg(feature = "perf-counters")]
+            perf_counters: GbaPerfCounters::default(),
         }
+    }
+
+    /// Retorna las métricas de rendimiento acumuladas y las reinicia a cero.
+    #[cfg(feature = "perf-counters")]
+    pub fn take_perf_counters(&mut self) -> GbaPerfCounters {
+        std::mem::take(&mut self.perf_counters)
     }
 
     /// Load a real BIOS image and switch the bus to real-BIOS mode:
@@ -401,6 +425,13 @@ impl MemMap {
     /// gap collapse into one held ledge (an audible thump per gap).
     fn pump_audio(&mut self, until: u64) {
         let until = until.min(self.clock);
+        if self.audio_cursor > until {
+            return;
+        }
+
+        #[cfg(feature = "perf-counters")]
+        let t_start = std::time::Instant::now();
+
         // The shadow mixers render on the same grid; hoisted out of
         // `self` so they can read guest memory while we mutate the taps.
         let mut mp2k = self.mp2k.take();
@@ -512,6 +543,11 @@ impl MemMap {
         self.mp2k = mp2k;
         self.gax = gax;
         self.rdrv = rdrv;
+
+        #[cfg(feature = "perf-counters")]
+        {
+            self.perf_counters.apu_ns += t_start.elapsed().as_nanos() as u64;
+        }
     }
 
     /// GAX HLE hook: dispatch loops call this when PC lands on one of
@@ -599,7 +635,16 @@ impl MemMap {
             VPhase::Hblank => {
                 let line = self.scanline();
                 if line < VISIBLE_SCANLINES {
+                    #[cfg(feature = "perf-counters")]
+                    let t_start = std::time::Instant::now();
+
                     crate::ppu::render_scanline(self, line as usize);
+
+                    #[cfg(feature = "perf-counters")]
+                    {
+                        self.perf_counters.ppu_ns += t_start.elapsed().as_nanos() as u64;
+                    }
+
                     self.trigger_dma(2); // HBlank timing (visible lines only)
                 }
                 if self.io[(DISPSTAT & 0x3FF) as usize] & 0x10 != 0 {
@@ -1131,6 +1176,10 @@ impl MemMap {
 
 impl Bus for MemMap {
     fn read8(&mut self, addr: u32) -> u8 {
+        #[cfg(feature = "perf-counters")]
+        {
+            self.perf_counters.reads += 1;
+        }
         match addr >> 24 {
             0x00 => {
                 if addr < 0x4000 {
@@ -1191,6 +1240,10 @@ impl Bus for MemMap {
     }
 
     fn write8(&mut self, addr: u32, value: u8) {
+        #[cfg(feature = "perf-counters")]
+        {
+            self.perf_counters.writes += 1;
+        }
         match addr >> 24 {
             0x02 => self.ewram[(addr & 0x3_FFFF) as usize] = value,
             0x03 => self.iwram[(addr & 0x7FFF) as usize] = value,
@@ -1233,6 +1286,10 @@ impl Bus for MemMap {
     }
 
     fn read16(&mut self, addr: u32) -> u16 {
+        #[cfg(feature = "perf-counters")]
+        {
+            self.perf_counters.reads += 1;
+        }
         match addr >> 24 {
             0x00 => {
                 if addr < 0x4000 {
@@ -1304,6 +1361,10 @@ impl Bus for MemMap {
     }
 
     fn read32(&mut self, addr: u32) -> u32 {
+        #[cfg(feature = "perf-counters")]
+        {
+            self.perf_counters.reads += 1;
+        }
         match addr >> 24 {
             0x00 => {
                 if addr < 0x4000 {
@@ -1375,6 +1436,10 @@ impl Bus for MemMap {
     }
 
     fn write16(&mut self, addr: u32, value: u16) {
+        #[cfg(feature = "perf-counters")]
+        {
+            self.perf_counters.writes += 1;
+        }
         // Bypass the byte-write quirks for naturally sized accesses.
         match addr >> 24 {
             0x02 => {
@@ -1415,6 +1480,10 @@ impl Bus for MemMap {
     }
 
     fn write32(&mut self, addr: u32, value: u32) {
+        #[cfg(feature = "perf-counters")]
+        {
+            self.perf_counters.writes += 1;
+        }
         let a = addr & !1;
         match a >> 24 {
             0x02 => {

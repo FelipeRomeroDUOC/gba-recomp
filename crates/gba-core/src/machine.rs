@@ -58,6 +58,12 @@ impl Machine {
         m
     }
 
+    /// Retorna las métricas de rendimiento del hardware acumuladas y las reinicia a cero.
+    #[cfg(feature = "perf-counters")]
+    pub fn take_perf_counters(&mut self) -> crate::mem::GbaPerfCounters {
+        self.bus.take_perf_counters()
+    }
+
     /// Execute one instruction (or service interrupt machinery).
     pub fn step(&mut self) -> StepEvent {
         // Wake from Halt when any enabled interrupt is latched (IME ignored).
