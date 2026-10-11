@@ -590,10 +590,13 @@ fn compose(
         return;
     }
 
+    let line_has_window = in_win0_y || in_win1_y || objwin_on;
+    let default_control = if !any_window { 0x3F } else { winout & 0x3F };
+
     for x in 0..VISIBLE_WIDTH {
         // Window control for this pixel: bits 0-3 BGs, 4 OBJ, 5 effects.
-        let control: u16 = if !any_window {
-            0x3F
+        let control: u16 = if !line_has_window {
+            default_control
         } else if in_win0_y && in_window_range((win0h >> 8) as u8, win0h as u8, x as u8) {
             winin & 0x3F
         } else if in_win1_y && in_window_range((win1h >> 8) as u8, win1h as u8, x as u8) {
@@ -609,33 +612,54 @@ fn compose(
         let obj = &obj_line[x];
         let obj_visible = obj.priority != 0xFF && control & 0x10 != 0;
 
-        let mut first: Option<(u16, usize)> = None;
-        let mut second: Option<(u16, usize)> = None;
-        'outer: for p in 0..4u8 {
-            if obj_visible && obj.priority == p {
-                if first.is_none() {
-                    first = Some((obj.color, 4));
+        let mut fc = backdrop;
+        let mut fl = 5usize;
+        let mut sc = backdrop;
+        let mut sl = 5usize;
+
+        let mut found_first = false;
+        let mut obj_handled = !obj_visible;
+
+        for &(bp, bg) in bg_prio {
+            if !obj_handled && obj.priority <= bp {
+                if !found_first {
+                    fc = obj.color;
+                    fl = 4;
+                    found_first = true;
                 } else {
-                    second = Some((obj.color, 4));
-                    break 'outer;
+                    sc = obj.color;
+                    sl = 4;
+                    obj_handled = true;
+                    break;
                 }
+                obj_handled = true;
             }
-            for &(bp, bg) in bg_prio {
-                if bp == p && control & (1 << bg) != 0 {
-                    let c = bg_lines[bg][x];
-                    if c != TRANSPARENT {
-                        if first.is_none() {
-                            first = Some((c, bg));
-                        } else {
-                            second = Some((c, bg));
-                            break 'outer;
-                        }
+
+            if control & (1 << bg) != 0 {
+                let c = bg_lines[bg][x];
+                if c != TRANSPARENT {
+                    if !found_first {
+                        fc = c;
+                        fl = bg;
+                        found_first = true;
+                    } else {
+                        sc = c;
+                        sl = bg;
+                        break;
                     }
                 }
             }
         }
-        let (fc, fl) = first.unwrap_or((backdrop, 5));
-        let (sc, sl) = second.unwrap_or((backdrop, 5));
+
+        if !obj_handled {
+            if !found_first {
+                fc = obj.color;
+                fl = 4;
+            } else {
+                sc = obj.color;
+                sl = 4;
+            }
+        }
 
         let effects_allowed = control & 0x20 != 0;
         let semi = obj_visible && fl == 4 && obj.semi;
@@ -675,6 +699,7 @@ fn in_window_range(x1: u8, x2: u8, v: u8) -> bool {
 // real hardware LSB of that lane is PRAM bit 15, which we mask at
 // palette fetch — see pal16).
 
+#[inline(always)]
 fn alpha_blend(a: u16, b: u16, eva: u32, evb: u32) -> u16 {
     let (ar, ag, ab) = split6(a);
     let (br, bg, bb) = split6(b);
@@ -684,6 +709,7 @@ fn alpha_blend(a: u16, b: u16, eva: u32, evb: u32) -> u16 {
     join6(r, g, b)
 }
 
+#[inline(always)]
 fn brighten(c: u16, evy: u32) -> u16 {
     let (r, g, b) = split6(c);
     join6(
@@ -693,6 +719,7 @@ fn brighten(c: u16, evy: u32) -> u16 {
     )
 }
 
+#[inline(always)]
 fn darken(c: u16, evy: u32) -> u16 {
     let (r, g, b) = split6(c);
     join6(
@@ -705,6 +732,7 @@ fn darken(c: u16, evy: u32) -> u16 {
 /// Channels as the blend unit sees them: 5-bit red/blue, 6-bit green
 /// lane (5-bit value doubled; hardware ORs in PRAM bit 15 as the LSB,
 /// which we strip at fetch).
+#[inline(always)]
 fn split6(c: u16) -> (u32, u32, u32) {
     (
         (c & 31) as u32,
@@ -713,6 +741,7 @@ fn split6(c: u16) -> (u32, u32, u32) {
     )
 }
 
+#[inline(always)]
 fn join6(r: u32, g: u32, b: u32) -> u16 {
     (r | ((g >> 1) << 5) | (b << 10)) as u16
 }
