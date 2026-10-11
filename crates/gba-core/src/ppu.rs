@@ -39,8 +39,10 @@ fn io16(mem: &MemMap, off: usize) -> u16 {
     u16::from_le_bytes([mem.io[off], mem.io[off + 1]])
 }
 
+#[inline(always)]
 fn pal16(mem: &MemMap, index: usize) -> u16 {
-    u16::from_le_bytes([mem.palette[index * 2], mem.palette[index * 2 + 1]]) & 0x7FFF
+    let off = index * 2;
+    u16::from_le_bytes([mem.palette[off], mem.palette[off + 1]]) & 0x7FFF
 }
 
 pub fn render_scanline(mem: &mut MemMap, line: usize) {
@@ -195,10 +197,10 @@ fn render_text_bg(mem: &MemMap, bg: usize, line: usize, out: &mut Line) {
             for i in 0..span {
                 let fx = if hflip { 7 - (px + i) } else { px + i };
                 let addr = base + fx;
-                let color_idx = if addr >= 0x1_0000 {
-                    0
-                } else {
+                let color_idx = if addr < 0x1_0000 {
                     mem.vram[addr] as usize
+                } else {
+                    0
                 };
                 out[sx + i] = if color_idx == 0 {
                     TRANSPARENT
@@ -209,24 +211,24 @@ fn render_text_bg(mem: &MemMap, bg: usize, line: usize, out: &mut Line) {
         } else {
             let base = char_base + tile * 32 + fy * 4;
             let pal_base = ((entry >> 12) as usize & 0xF) * 16;
+            let row_bytes = if base + 4 <= 0x1_0000 {
+                u32::from_le_bytes([
+                    mem.vram[base],
+                    mem.vram[base + 1],
+                    mem.vram[base + 2],
+                    mem.vram[base + 3],
+                ])
+            } else {
+                0
+            };
+
             for i in 0..span {
                 let fx = if hflip { 7 - (px + i) } else { px + i };
-                let addr = base + fx / 2;
-                let color_idx = if addr >= 0x1_0000 {
-                    0
-                } else {
-                    let b = mem.vram[addr];
-                    let nib = if fx & 1 == 0 { b & 0xF } else { b >> 4 } as usize;
-                    if nib == 0 {
-                        0
-                    } else {
-                        pal_base + nib
-                    }
-                };
-                out[sx + i] = if color_idx == 0 {
+                let nib = ((row_bytes >> (fx * 4)) & 0xF) as usize;
+                out[sx + i] = if nib == 0 {
                     TRANSPARENT
                 } else {
-                    pal16(mem, color_idx)
+                    pal16(mem, pal_base + nib)
                 };
             }
         }
@@ -404,12 +406,24 @@ fn render_sprites(
         };
 
         let ly = line - y;
-        for bx in 0..bw {
-            let sx = x + bx;
-            if !(0..VISIBLE_WIDTH as i32).contains(&sx) {
-                continue;
+        let min_bx = (-x).max(0);
+        let max_bx = (VISIBLE_WIDTH as i32 - x).min(bw);
+        if min_bx >= max_bx {
+            continue;
+        }
+
+        let non_affine_v = if !affine {
+            let mut v = ly;
+            if a1 & 0x2000 != 0 {
+                v = h - 1 - v;
             }
-            let sx_usize = sx as usize;
+            Some((v / 8, v % 8))
+        } else {
+            None
+        };
+
+        for bx in min_bx..max_bx {
+            let sx_usize = (x + bx) as usize;
 
             // Texture coordinates.
             let (u, v) = if affine {
@@ -423,20 +437,18 @@ fn render_sprites(
                 (u, v)
             } else {
                 let mut u = bx;
-                let mut v = ly;
-                // OBJ attr1 flips: bit 12 horizontal, bit 13 vertical
-                // (unlike BG map entries, where flips are bits 10/11).
                 if a1 & 0x1000 != 0 {
                     u = w - 1 - u;
                 }
-                if a1 & 0x2000 != 0 {
-                    v = h - 1 - v;
-                }
-                (u, v)
+                (u, 0)
             };
 
             let (tu, pu) = (u / 8, u % 8);
-            let (tv, pv) = (v / 8, v % 8);
+            let (tv, pv) = if let Some((ntv, npv)) = non_affine_v {
+                (ntv, npv)
+            } else {
+                (v / 8, v % 8)
+            };
             let tile_step = if eight_bpp { 2 } else { 1 };
             let tile = tile_base + tv as usize * row_tiles as usize + tu as usize * tile_step;
             // In bitmap modes the first 512 tiles overlap the bitmap.
@@ -838,5 +850,41 @@ mod tests {
         // Green lane: brighten green 0 by 1/16 -> g6 = (63+8)>>4 = 4,
         // back to 5-bit = 2.
         assert_eq!((brighten(0, 1) >> 5) & 31, 2);
+    }
+
+    #[test]
+    fn text_tile_4bpp_nibble_order_and_hflip() {
+        let mut mem = MemMap::new(vec![]);
+        mem.write16(0x0400_0000, 0x0100); // mode 0, BG0 on
+        mem.write16(0x0400_0008, 31 << 8); // screen base 31 (0xF800)
+
+        // Palette 0: colors 1..8
+        for c in 1..=8u16 {
+            mem.write16(0x0500_0000 + (c as u32) * 2, c);
+        }
+
+        // Tile 1 row 0: nibbles 1, 2, 3, 4, 5, 6, 7, 8
+        // Byte 0: 0x21 (px0=1, px1=2)
+        // Byte 1: 0x43 (px2=3, px3=4)
+        // Byte 2: 0x65 (px4=5, px5=6)
+        // Byte 3: 0x87 (px6=7, px7=8)
+        // Little-endian u32 = 0x87654321
+        mem.write32(0x0600_0000 + 32, 0x8765_4321);
+
+        // Map entry 0: tile 1, no flip
+        mem.write16(0x0600_F800, 1);
+        render_scanline(&mut mem, 0);
+
+        for px in 0..8 {
+            assert_eq!(mem.framebuffer[px], (px as u16) + 1, "unflipped px {}", px);
+        }
+
+        // Map entry 0: tile 1 with hflip (bit 10)
+        mem.write16(0x0600_F800, 1 | 0x0400);
+        render_scanline(&mut mem, 0);
+
+        for px in 0..8 {
+            assert_eq!(mem.framebuffer[px], 8 - (px as u16), "hflip px {}", px);
+        }
     }
 }
