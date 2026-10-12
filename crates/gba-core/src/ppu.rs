@@ -50,8 +50,18 @@ pub fn render_scanline(mem: &mut MemMap, line: usize) {
 
     if dispcnt & 0x80 != 0 {
         // Forced blank: white.
+        #[cfg(feature = "perf-counters")]
+        let t_copy = crate::perf_clock::ticks();
+
         let row = &mut mem.framebuffer[line * VISIBLE_WIDTH..(line + 1) * VISIBLE_WIDTH];
         row.fill(0x7FFF);
+
+        #[cfg(feature = "perf-counters")]
+        {
+            let copy_ns = crate::perf_clock::ns_since(t_copy);
+            mem.perf_counters.copy_ns += copy_ns;
+            mem.perf_counters.ppu_ns += copy_ns;
+        }
         return;
     }
 
@@ -66,6 +76,9 @@ pub fn render_scanline(mem: &mut MemMap, line: usize) {
         mem.aff_ref[3] = sign_extend28(read_io32(mem, 0x3C));
         mem.aff_dirty[1] = false;
     }
+
+    #[cfg(feature = "perf-counters")]
+    let t_bg = crate::perf_clock::ticks();
 
     let mode = dispcnt & 7;
     let mut bg_lines = [[TRANSPARENT; VISIBLE_WIDTH]; 4];
@@ -109,12 +122,32 @@ pub fn render_scanline(mem: &mut MemMap, line: usize) {
         _ => {}
     }
 
+    #[cfg(feature = "perf-counters")]
+    let t_sprite = crate::perf_clock::ticks();
+    #[cfg(feature = "perf-counters")]
+    {
+        // `ppu_ns` is the sum of its parts: the scanline carries no timer of
+        // its own, so nothing is attributed twice and nothing is left over.
+        let bg_ns = crate::perf_clock::ns_between(t_bg, t_sprite);
+        mem.perf_counters.bg_ns += bg_ns;
+        mem.perf_counters.ppu_ns += bg_ns;
+        mem.perf_counters.fondos_activos += bg_used.iter().filter(|&&u| u).count() as u64;
+    }
+
     // Sprites.
     let mut obj_line = [OBJ_EMPTY; VISIBLE_WIDTH];
     let mut obj_window = [false; VISIBLE_WIDTH];
-    let mut line_has_semi = false;
     if dispcnt & 0x1000 != 0 {
-        line_has_semi = render_sprites(mem, dispcnt, line, &mut obj_line, &mut obj_window);
+        render_sprites(mem, dispcnt, line, &mut obj_line, &mut obj_window);
+    }
+
+    #[cfg(feature = "perf-counters")]
+    let t_compose = crate::perf_clock::ticks();
+    #[cfg(feature = "perf-counters")]
+    {
+        let sprite_ns = crate::perf_clock::ns_between(t_sprite, t_compose);
+        mem.perf_counters.sprite_ns += sprite_ns;
+        mem.perf_counters.ppu_ns += sprite_ns;
     }
 
     // Step affine accumulators for the next line (PB/PD).
@@ -131,8 +164,14 @@ pub fn render_scanline(mem: &mut MemMap, line: usize) {
         &bg_used,
         &obj_line,
         &obj_window,
-        line_has_semi,
     );
+
+    #[cfg(feature = "perf-counters")]
+    {
+        let compose_ns = crate::perf_clock::ns_since(t_compose);
+        mem.perf_counters.compose_ns += compose_ns;
+        mem.perf_counters.ppu_ns += compose_ns;
+    }
 }
 
 fn read_io32(mem: &MemMap, off: usize) -> u32 {
@@ -341,21 +380,21 @@ const OBJ_SIZES: [[(i32, i32); 4]; 3] = [
 /// Returns true if any semi-transparent sprite pixel was written
 /// (conservative: a later overwrite by an opaque sprite still counts).
 fn render_sprites(
-    mem: &MemMap,
+    mem: &mut MemMap,
     dispcnt: u16,
     line: usize,
     out: &mut [ObjPixel; VISIBLE_WIDTH],
     window: &mut [bool; VISIBLE_WIDTH],
-) -> bool {
-    let mut any_semi = false;
+) {
     let one_dim = dispcnt & 0x40 != 0;
     let bitmap_mode = (dispcnt & 7) >= 3;
     let line = line as i32;
 
     for i in 0..128 {
+        // Attribute 0 decides whether the rest is worth reading: disabled and
+        // prohibited entries are the bulk of OAM, and reading all three
+        // attributes cost three 16-bit reads per entry per scanline.
         let a0 = u16::from_le_bytes([mem.oam[i * 8], mem.oam[i * 8 + 1]]);
-        let a1 = u16::from_le_bytes([mem.oam[i * 8 + 2], mem.oam[i * 8 + 3]]);
-        let a2 = u16::from_le_bytes([mem.oam[i * 8 + 4], mem.oam[i * 8 + 5]]);
 
         let affine = a0 & 0x100 != 0;
         if !affine && a0 & 0x200 != 0 {
@@ -365,6 +404,7 @@ fn render_sprites(
         if shape == 3 {
             continue; // prohibited
         }
+        let a1 = u16::from_le_bytes([mem.oam[i * 8 + 2], mem.oam[i * 8 + 3]]);
         let size_idx = ((a1 >> 14) & 3) as usize;
         let (w, h) = OBJ_SIZES[shape][size_idx];
         let double = affine && a0 & 0x200 != 0;
@@ -382,6 +422,8 @@ fn render_sprites(
             continue;
         }
 
+        // Only entries that cover this scanline need their tile/palette data.
+        let a2 = u16::from_le_bytes([mem.oam[i * 8 + 4], mem.oam[i * 8 + 5]]);
         let mode = (a0 >> 10) & 3;
         let eight_bpp = a0 & 0x2000 != 0;
         let tile_base = (a2 & 0x3FF) as usize;
@@ -410,6 +452,11 @@ fn render_sprites(
         let max_bx = (VISIBLE_WIDTH as i32 - x).min(bw);
         if min_bx >= max_bx {
             continue;
+        }
+
+        #[cfg(feature = "perf-counters")]
+        {
+            mem.perf_counters.sprites_visibles += 1;
         }
 
         let non_affine_v = if !affine {
@@ -488,14 +535,79 @@ fn render_sprites(
                     priority,
                     semi: mode == 1,
                 };
-                any_semi |= mode == 1;
             }
         }
     }
-    any_semi
 }
 
 // ---- composition ----
+
+/// The two topmost visible layers at one pixel: `(color, layer, second color,
+/// second layer)`, with layer ids 0-3 = BGs, 4 = OBJ, 5 = backdrop. OBJ ranks
+/// above BGs of equal priority; BGs tie-break by index via the pre-sorted list.
+///
+/// Callers that know the second layer cannot matter (see `compose`) avoid it.
+#[inline(always)]
+fn top_two_layers(
+    bg_lines: &[Line; 4],
+    bg_prio: &[(u8, usize)],
+    control: u16,
+    x: usize,
+    obj: &ObjPixel,
+    backdrop: u16,
+) -> (u16, usize, u16, usize) {
+    let obj_visible = obj.priority != 0xFF && control & 0x10 != 0;
+    let mut fc = backdrop;
+    let mut fl = 5usize;
+    let mut sc = backdrop;
+    let mut sl = 5usize;
+
+    let mut found_first = false;
+    let mut obj_handled = !obj_visible;
+
+    for &(bp, bg) in bg_prio {
+        if !obj_handled && obj.priority <= bp {
+            if !found_first {
+                fc = obj.color;
+                fl = 4;
+                found_first = true;
+            } else {
+                sc = obj.color;
+                sl = 4;
+                obj_handled = true;
+                break;
+            }
+            obj_handled = true;
+        }
+
+        if control & (1 << bg) != 0 {
+            let c = bg_lines[bg][x];
+            if c != TRANSPARENT {
+                if !found_first {
+                    fc = c;
+                    fl = bg;
+                    found_first = true;
+                } else {
+                    sc = c;
+                    sl = bg;
+                    break;
+                }
+            }
+        }
+    }
+
+    if !obj_handled {
+        if !found_first {
+            fc = obj.color;
+            fl = 4;
+        } else {
+            sc = obj.color;
+            sl = 4;
+        }
+    }
+
+    (fc, fl, sc, sl)
+}
 
 /// Layer ids for blend targeting: 0-3 BGs, 4 OBJ, 5 backdrop.
 #[allow(clippy::too_many_arguments)]
@@ -507,7 +619,6 @@ fn compose(
     bg_used: &[bool; 4],
     obj_line: &[ObjPixel; VISIBLE_WIDTH],
     obj_window: &[bool; VISIBLE_WIDTH],
-    line_has_semi: bool,
 ) {
     let backdrop = pal16(mem, 0);
 
@@ -549,53 +660,12 @@ fn compose(
 
     let row = line * VISIBLE_WIDTH;
 
-    // Fast path: no color effects and no semi-transparent sprite pixels
-    // on this line, so the second-layer search is dead code — the top
-    // layer alone decides each pixel: the first opaque BG in priority
-    // order whose window control bit allows it, beaten by the sprite
-    // when its priority is <= that BG's (sprites rank above BGs of
-    // equal priority).
-    if blend_mode == 0 && !line_has_semi {
-        for x in 0..VISIBLE_WIDTH {
-            let control: u16 = if !any_window {
-                0x3F
-            } else if in_win0_y && in_window_range((win0h >> 8) as u8, win0h as u8, x as u8) {
-                winin & 0x3F
-            } else if in_win1_y && in_window_range((win1h >> 8) as u8, win1h as u8, x as u8) {
-                (winin >> 8) & 0x3F
-            } else if objwin_on && obj_window[x] {
-                (winout >> 8) & 0x3F
-            } else {
-                winout & 0x3F
-            };
-
-            let mut color = backdrop;
-            let mut top_prio = 0xFFu8;
-            for &(bp, bg) in bg_prio {
-                if control & (1 << bg) != 0 {
-                    let c = bg_lines[bg][x];
-                    if c != TRANSPARENT {
-                        color = c;
-                        top_prio = bp;
-                        break;
-                    }
-                }
-            }
-            let obj = &obj_line[x];
-            if obj.priority != 0xFF && control & 0x10 != 0 && obj.priority <= top_prio {
-                color = obj.color;
-            }
-            mem.framebuffer[row + x] = color;
-        }
-        return;
-    }
-
     let line_has_window = in_win0_y || in_win1_y || objwin_on;
     let default_control = if !any_window { 0x3F } else { winout & 0x3F };
 
-    for x in 0..VISIBLE_WIDTH {
-        // Window control for this pixel: bits 0-3 BGs, 4 OBJ, 5 effects.
-        let control: u16 = if !line_has_window {
+    // Window control for one pixel: bits 0-3 BGs, 4 OBJ, 5 effects.
+    let control_at = |x: usize| -> u16 {
+        if !line_has_window {
             default_control
         } else if in_win0_y && in_window_range((win0h >> 8) as u8, win0h as u8, x as u8) {
             winin & 0x3F
@@ -605,61 +675,72 @@ fn compose(
             (winout >> 8) & 0x3F
         } else {
             winout & 0x3F
-        };
+        }
+    };
+
+    // No colour effects this frame: every pixel's colour is simply the top
+    // visible layer, so the second-layer search only matters where a
+    // semi-transparent OBJ pixel sits on top and the blend list targets what is
+    // underneath. Deferring that search to those pixels is what makes a line
+    // with a single translucent sprite pixel cost the same as one without,
+    // instead of sending all 240 pixels down the two-layer path.
+    if blend_mode == 0 {
+        for x in 0..VISIBLE_WIDTH {
+            let control = control_at(x);
+            let obj = &obj_line[x];
+            let obj_visible = obj.priority != 0xFF && control & 0x10 != 0;
+
+            // Top layer: the first opaque BG in priority order whose window
+            // control bit allows it, beaten by the sprite when its priority is
+            // <= that BG's (sprites rank above BGs of equal priority).
+            let mut color = backdrop;
+            let mut top_prio = 0xFFu8;
+            let mut top_is_obj = false;
+            for &(bp, bg) in bg_prio {
+                if obj_visible && obj.priority <= bp {
+                    color = obj.color;
+                    top_prio = obj.priority;
+                    top_is_obj = true;
+                    break;
+                }
+                if control & (1 << bg) != 0 {
+                    let c = bg_lines[bg][x];
+                    if c != TRANSPARENT {
+                        color = c;
+                        top_prio = bp;
+                        break;
+                    }
+                }
+            }
+            if !top_is_obj && obj_visible && top_prio == 0xFF {
+                color = obj.color;
+                top_is_obj = true;
+            }
+
+            if top_is_obj && obj.semi {
+                // A translucent sprite pixel is on top, so now (and only now)
+                // the layer below it decides the result.
+                let (fc, _fl, sc, sl) =
+                    top_two_layers(bg_lines, bg_prio, control, x, obj, backdrop);
+                if bldcnt & (0x100 << sl) != 0 {
+                    // Semi-transparent sprite forces alpha against 2nd targets.
+                    color = alpha_blend(fc, sc, eva, evb);
+                }
+            }
+
+            mem.framebuffer[row + x] = color;
+        }
+        return;
+    }
+
+    for x in 0..VISIBLE_WIDTH {
+        let control = control_at(x);
 
         // Find the top two visible layers (OBJ ranks above BGs of equal
         // priority; BGs tie-break by index via the pre-sorted list).
         let obj = &obj_line[x];
         let obj_visible = obj.priority != 0xFF && control & 0x10 != 0;
-
-        let mut fc = backdrop;
-        let mut fl = 5usize;
-        let mut sc = backdrop;
-        let mut sl = 5usize;
-
-        let mut found_first = false;
-        let mut obj_handled = !obj_visible;
-
-        for &(bp, bg) in bg_prio {
-            if !obj_handled && obj.priority <= bp {
-                if !found_first {
-                    fc = obj.color;
-                    fl = 4;
-                    found_first = true;
-                } else {
-                    sc = obj.color;
-                    sl = 4;
-                    obj_handled = true;
-                    break;
-                }
-                obj_handled = true;
-            }
-
-            if control & (1 << bg) != 0 {
-                let c = bg_lines[bg][x];
-                if c != TRANSPARENT {
-                    if !found_first {
-                        fc = c;
-                        fl = bg;
-                        found_first = true;
-                    } else {
-                        sc = c;
-                        sl = bg;
-                        break;
-                    }
-                }
-            }
-        }
-
-        if !obj_handled {
-            if !found_first {
-                fc = obj.color;
-                fl = 4;
-            } else {
-                sc = obj.color;
-                sl = 4;
-            }
-        }
+        let (fc, fl, sc, sl) = top_two_layers(bg_lines, bg_prio, control, x, obj, backdrop);
 
         let effects_allowed = control & 0x20 != 0;
         let semi = obj_visible && fl == 4 && obj.semi;
@@ -667,7 +748,7 @@ fn compose(
         let color = if semi && bldcnt & (0x100 << sl) != 0 {
             // Semi-transparent sprite forces alpha against 2nd targets.
             alpha_blend(fc, sc, eva, evb)
-        } else if effects_allowed && blend_mode != 0 && bldcnt & (1 << fl) != 0 {
+        } else if effects_allowed && bldcnt & (1 << fl) != 0 {
             match blend_mode {
                 1 if bldcnt & (0x100 << sl) != 0 => alpha_blend(fc, sc, eva, evb),
                 2 => brighten(fc, evy),

@@ -2743,6 +2743,32 @@ fn cmd_runc(args: &[String]) -> Result<(), String> {
         }
     }
 
+    // RECOMP_PPU_STATS=1 (binary built with `--features perf-counters`): print
+    // where the emulated-hardware time went. The counters accumulate over the
+    // whole run, so dividing by frames gives the same per-frame figures a
+    // device-side `t=` line reports in `ppu=`/`ppubg=`/`ppuspr=`/`ppucomp=`.
+    #[cfg(feature = "perf-counters")]
+    if std::env::var_os("RECOMP_PPU_STATS").is_some() {
+        let hw = m.take_perf_counters();
+        let n = m.bus.frames.max(1) as f64;
+        let per_frame = |ns: u64| ns as f64 / 1_000_000.0 / n;
+        eprintln!(
+            "PPU_STATS frames={} ppu={:.3} bg={:.3} spr={:.3} compose={:.3} copy={:.3} apu={:.3} \
+             sprites_visibles={:.1} fondos_activos={:.1} reads={:.1} writes={:.1} (ms per frame)",
+            m.bus.frames,
+            per_frame(hw.ppu_ns),
+            per_frame(hw.bg_ns),
+            per_frame(hw.sprite_ns),
+            per_frame(hw.compose_ns),
+            per_frame(hw.copy_ns),
+            per_frame(hw.apu_ns),
+            hw.sprites_visibles as f64 / n,
+            hw.fondos_activos as f64 / n,
+            hw.reads as f64 / n,
+            hw.writes as f64 / n,
+        );
+    }
+
     // FNV-1a framebuffer hash — must match the interpreter's `frames` run.
     let mut hash = 0xcbf2_9ce4_8422_2325u64;
     for &px in &m.bus.framebuffer {

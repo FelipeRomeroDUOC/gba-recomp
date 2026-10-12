@@ -22,6 +22,8 @@ pub mod hostclock;
 pub mod machine;
 pub mod mem;
 pub mod mp2k;
+#[cfg(feature = "perf-counters")]
+pub mod perf_clock;
 pub mod ppu;
 pub mod rdrv;
 pub mod rtc;

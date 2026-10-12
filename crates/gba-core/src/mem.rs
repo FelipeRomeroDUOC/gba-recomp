@@ -234,7 +234,9 @@ pub struct MemMap {
 #[cfg(feature = "perf-counters")]
 #[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GbaPerfCounters {
-    /// Tiempo acumulado en nanosegundos ejecutando la PPU (`render_scanline`).
+    /// Tiempo acumulado en nanosegundos ejecutando la PPU: la suma de sus cuatro
+    /// partes (`copy_ns` + `bg_ns` + `sprite_ns` + `compose_ns`), cada una
+    /// cronometrada con `perf_clock` dentro de `render_scanline`.
     pub ppu_ns: u64,
     /// Tiempo acumulado en nanosegundos avanzando el APU (`pump_audio`).
     pub apu_ns: u64,
@@ -242,6 +244,18 @@ pub struct GbaPerfCounters {
     pub reads: u64,
     /// Total de accesos de escritura a memoria (write8, write16, write32).
     pub writes: u64,
+    /// Nanosegundos acumulados renderizando capas de fondo (texto, rotación, bitmap).
+    pub bg_ns: u64,
+    /// Nanosegundos acumulados evaluando y dibujando sprites OAM.
+    pub sprite_ns: u64,
+    /// Nanosegundos acumulados resolviendo prioridades, ventanas y efectos de color.
+    pub compose_ns: u64,
+    /// Nanosegundos acumulados en copias explícitas de escaneo (forced blank).
+    pub copy_ns: u64,
+    /// Cantidad de sprites que superaron el culling y fueron rasterizados.
+    pub sprites_visibles: u64,
+    /// Cantidad de capas de fondo activas procesadas.
+    pub fondos_activos: u64,
 }
 
 /// 65536 Hz on the 16.78 MHz master clock — the PWM grid most games
@@ -635,16 +649,11 @@ impl MemMap {
             VPhase::Hblank => {
                 let line = self.scanline();
                 if line < VISIBLE_SCANLINES {
-                    #[cfg(feature = "perf-counters")]
-                    let t_start = std::time::Instant::now();
-
+                    // `render_scanline` accumulates `ppu_ns` itself, from the
+                    // same four parts it reports separately. Wrapping the call
+                    // in another clock read cost a second timestamp per line
+                    // for a total that was already the sum of those parts.
                     crate::ppu::render_scanline(self, line as usize);
-
-                    #[cfg(feature = "perf-counters")]
-                    {
-                        self.perf_counters.ppu_ns += t_start.elapsed().as_nanos() as u64;
-                    }
-
                     self.trigger_dma(2); // HBlank timing (visible lines only)
                 }
                 if self.io[(DISPSTAT & 0x3FF) as usize] & 0x10 != 0 {

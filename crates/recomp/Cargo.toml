@@ -21,3 +21,9 @@ menu = { version = "0.2.0", path = "../menu" }
 sha2 = "0.11.0"
 dirs = "6.0.0"
 toml = "0.8"
+
+[features]
+# Per-phase timing counters for the emulated hardware (PPU/APU). Diagnostic
+# only: `cargo build -p recomp --features perf-counters` plus
+# `RECOMP_PPU_STATS=1` makes `runc` report where the frame time went.
+perf-counters = ["gba-core/perf-counters"]
