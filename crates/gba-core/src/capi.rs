@@ -78,7 +78,7 @@ extern "C" fn rt_write32(m: *mut core::ffi::c_void, a: u32, v: u32) {
     crate::Bus::write32(&mut mach!(m).bus, a, v)
 }
 extern "C" fn rt_tick(m: *mut core::ffi::c_void, cycles: u32) {
-    mach!(m).bus.tick(cycles as u64)
+    mach!(m).bus.tick_fast(cycles as u64)
 }
 
 extern "C" fn rt_guard(m: *mut core::ffi::c_void, addr: u32, len: u32, expect: u64) -> u32 {
@@ -121,7 +121,7 @@ pub extern "C" fn rt_interp_one(m: *mut core::ffi::c_void) -> u32 {
     } else {
         exec::step_hle_cached(&mut m.cpu, &mut m.bus, &mut m.decode_cache)
     };
-    m.bus.tick(crate::machine::instr_cost(region, &instr));
+    m.bus.tick_fast(crate::machine::instr_cost(region, &instr));
     m.cpu.regs[15] | m.cpu.thumb() as u32
 }
 

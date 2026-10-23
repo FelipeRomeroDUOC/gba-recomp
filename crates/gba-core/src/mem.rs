@@ -157,7 +157,37 @@ pub struct MemMap {
     pub frames: u64,
     #[cfg(feature = "perf-counters")]
     pub perf_counters: GbaPerfCounters,
+    /// Copia de E/S (0x00 a 0x5F) de la última línea dibujada, para contar cambios.
+    #[cfg(feature = "perf-video")]
+    pub copia_linea_io: [u8; 0x60],
+    /// Copia de la paleta de la última línea dibujada, para contar cambios.
+    #[cfg(feature = "perf-video")]
+    pub copia_linea_paleta: Vec<u8>,
+    /// Copia de la VRAM de la última línea dibujada, para contar cambios.
+    #[cfg(feature = "perf-video")]
+    pub copia_linea_vram: Vec<u8>,
+    /// Copia de la OAM de la última línea dibujada, para contar cambios.
+    #[cfg(feature = "perf-video")]
+    pub copia_linea_oam: Vec<u8>,
+    /// Si está activo, cada línea visible guarda su estado en `capturas_linea` antes de dibujarse (solo perf-video).
+    #[cfg(feature = "perf-video")]
+    pub capturar_linea: bool,
+    /// Estado de cada línea capturada mientras `capturar_linea` está activo (solo perf-video).
+    #[cfg(feature = "perf-video")]
+    pub capturas_linea: Vec<CapturaLinea>,
+    /// Interruptor de la medición de tiempo del APU. Apagado: solo se cuentan
+    /// llamadas y muestras, sin leer el reloj. Encendido: se cronometra cada llamada.
+    #[cfg(feature = "perf-counters")]
+    pub perf_audio_timing: bool,
 
+    /// Si está activo, omite el renderizado de la PPU por software en CPU (para aceleración por GPU).
+    pub omitir_ppu_software: bool,
+    /// Si está activo, copia los registros de E/S y paleta en cada scanline visible para la GPU.
+    pub capturar_lut_ligera: bool,
+    /// Registros de E/S (0x00..0x5F) capturados por línea visible (0..160).
+    pub io_lineas: Box<[[u8; 0x60]; 160]>,
+    /// Paleta (1024 bytes) capturada por línea visible (0..160).
+    pub paleta_lineas: Box<[[u8; 1024]; 160]>,
     /// 240×160 RGB555 output, written per scanline by the PPU.
     pub framebuffer: Vec<u16>,
     /// Affine BG reference-point accumulators (bg2x, bg2y, bg3x, bg3y),
@@ -239,11 +269,42 @@ pub struct GbaPerfCounters {
     /// cronometrada con `perf_clock` dentro de `render_scanline`.
     pub ppu_ns: u64,
     /// Tiempo acumulado en nanosegundos avanzando el APU (`pump_audio`).
+    /// Solo se acumula con `perf_audio_timing` activo (lectura de reloj en cada llamada).
     pub apu_ns: u64,
+    /// Llamadas a `pump_audio` que avanzaron el muestreo (contador entero, sin reloj).
+    pub pump_llamadas: u64,
+    /// Muestras de 65.536 Hz generadas por `pump_audio`.
+    pub pump_muestras: u64,
     /// Total de accesos de lectura a memoria (read8, read16, read32).
     pub reads: u64,
     /// Total de accesos de escritura a memoria (write8, write16, write32).
     pub writes: u64,
+    /// Escrituras a E/S, paleta, VRAM y OAM (regiones 0x04 a 0x07), acumuladas.
+    /// Un acceso de 16 o 32 bits a E/S se cuenta por byte, igual que `writes`.
+    #[cfg(feature = "perf-video")]
+    pub escrituras_video: u64,
+    /// De las anteriores, las que van a registros de E/S (región 0x04).
+    #[cfg(feature = "perf-video")]
+    pub escrituras_es: u64,
+    /// Líneas visibles (1 a 159 de cada cuadro) cuyos registros de E/S (0x00 a 0x5F)
+    /// o paleta cambiaron respecto a la línea anterior.
+    #[cfg(feature = "perf-video")]
+    pub lineas_con_cambio: u64,
+    /// Bit `n` en 1 = la línea `n` del cuadro cambió sus registros. Lo pone el harness a 0 antes de cada cuadro.
+    #[cfg(feature = "perf-video")]
+    pub mascara_lineas: [u64; 3],
+    /// Líneas visibles con VRAM distinta de la línea anterior (solo perf-video).
+    #[cfg(feature = "perf-video")]
+    pub lineas_vram_cambio: u64,
+    /// Líneas visibles con OAM distinta de la línea anterior (solo perf-video).
+    #[cfg(feature = "perf-video")]
+    pub lineas_oam_cambio: u64,
+    /// Bits de las líneas con VRAM cambiada (mismo formato que `mascara_lineas`).
+    #[cfg(feature = "perf-video")]
+    pub mascara_vram: [u64; 3],
+    /// Bits de las líneas con OAM cambiada (mismo formato que `mascara_lineas`).
+    #[cfg(feature = "perf-video")]
+    pub mascara_oam: [u64; 3],
     /// Nanosegundos acumulados renderizando capas de fondo (texto, rotación, bitmap).
     pub bg_ns: u64,
     /// Nanosegundos acumulados evaluando y dibujando sprites OAM.
@@ -256,6 +317,49 @@ pub struct GbaPerfCounters {
     pub sprites_visibles: u64,
     /// Cantidad de capas de fondo activas procesadas.
     pub fondos_activos: u64,
+    /// Líneas compuestas por la vía rápida (tramos de control constante) desde el
+    /// último vaciado.
+    pub lineas_rectas: u64,
+    /// De las anteriores, cuántas lo son porque `BLDCNT` pide un efecto de color que
+    /// no puede cambiar ningún píxel (oscurecer o aclarar con `BLDY = 0`, o alpha sin
+    /// segundos objetivos).
+    pub lineas_inertes: u64,
+    /// De las anteriores, cuántas aplicaron un aclarado u oscurecido real en la propia
+    /// vía rápida (modos 2 y 3, que no necesitan la segunda capa).
+    pub lineas_efecto: u64,
+    /// De las anteriores, cuántas piden alpha (modo 1).
+    pub lineas_efecto_alpha: u64,
+    /// De las anteriores, cuántas piden aclarar (modo 2).
+    pub lineas_efecto_brillo: u64,
+    /// De las anteriores, cuántas piden oscurecer (modo 3).
+    pub lineas_efecto_oscuridad: u64,
+    /// Líneas descartadas de la vía rápida porque `BLDCNT` pide un efecto de color real
+    /// que no se puede aplicar sin la segunda capa (el alpha del modo 1).
+    pub descartes_mezcla: u64,
+    /// Líneas descartadas por la ventana de sprites (`OBJWIN`).
+    pub descartes_ventana: u64,
+    /// Líneas descartadas por un pixel de sprite translucido.
+    pub descartes_semi: u64,
+    /// Líneas compuestas por la vía por tramos del alpha (`compose_alpha_tramos`).
+    pub lineas_alpha_tramos: u64,
+    /// Líneas compuestas por el camino general por píxel, la referencia de fidelidad.
+    pub lineas_camino_general: u64,
+    /// Líneas con algún píxel de sprite translúcido (`obj_semi`), sea cual sea el camino.
+    pub lineas_con_sprite_semi: u64,
+}
+
+/// Campos que lee el renderizado de una línea, copiados justo antes de dibujarla (solo perf-video).
+#[cfg(feature = "perf-video")]
+#[derive(Clone)]
+pub struct CapturaLinea {
+    /// Línea visible (0 a 159) a la que corresponde la copia.
+    pub linea: usize,
+    pub io: Vec<u8>,
+    pub palette: Vec<u8>,
+    pub vram: Vec<u8>,
+    pub oam: Vec<u8>,
+    pub aff_ref: [i32; 4],
+    pub aff_dirty: [bool; 2],
 }
 
 /// 65536 Hz on the 16.78 MHz master clock — the PWM grid most games
@@ -339,6 +443,24 @@ impl MemMap {
             next_event: HBLANK_FLAG_CYCLE,
             #[cfg(feature = "perf-counters")]
             perf_counters: GbaPerfCounters::default(),
+            #[cfg(feature = "perf-video")]
+            copia_linea_io: [0; 0x60],
+            #[cfg(feature = "perf-video")]
+            copia_linea_paleta: vec![0; 0x400],
+            #[cfg(feature = "perf-video")]
+            copia_linea_vram: vec![0; 0x1_8000],
+            #[cfg(feature = "perf-video")]
+            copia_linea_oam: vec![0; 0x400],
+            #[cfg(feature = "perf-video")]
+            capturar_linea: false,
+            #[cfg(feature = "perf-video")]
+            capturas_linea: Vec::new(),
+            #[cfg(feature = "perf-counters")]
+            perf_audio_timing: false,
+            omitir_ppu_software: false,
+            capturar_lut_ligera: false,
+            io_lineas: Box::new([[0u8; 0x60]; 160]),
+            paleta_lineas: Box::new([[0u8; 1024]; 160]),
         }
     }
 
@@ -424,13 +546,18 @@ impl MemMap {
     /// audio grid samples up to each event first so they see the DAC/PSG
     /// state that was current at their own instants.
     pub fn tick(&mut self, cycles: u64) {
+        self.tick_fast(cycles);
+        self.pump_audio(self.clock);
+    }
+
+    /// Advance the clock and process due video/timer/DMA events, WITHOUT
+    /// generating audio. Audio is pumped lazily, right before any state
+    /// change that the samples depend on (see `pump_audio` call sites).
+    pub fn tick_fast(&mut self, cycles: u64) {
         self.clock += cycles;
         while self.clock >= self.next_event {
-            let ev = self.next_event;
-            self.pump_audio(ev);
             self.process_events();
         }
-        self.pump_audio(self.clock);
     }
 
     /// Generate audio samples on the 65536 Hz grid up to `until` (capped
@@ -444,14 +571,26 @@ impl MemMap {
         }
 
         #[cfg(feature = "perf-counters")]
-        let t_start = std::time::Instant::now();
+        {
+            self.perf_counters.pump_llamadas += 1;
+        }
+        #[cfg(feature = "perf-counters")]
+        let t_start = if self.perf_audio_timing {
+            Some(crate::perf_clock::ticks())
+        } else {
+            None
+        };
 
         // The shadow mixers render on the same grid; hoisted out of
         // `self` so they can read guest memory while we mutate the taps.
-        let mut mp2k = self.mp2k.take();
-        let mut gax = self.gax.take();
-        let mut rdrv = self.rdrv.take();
+        let mut mp2k = if self.tap_channels { self.mp2k.take() } else { None };
+        let mut gax = if self.tap_channels { self.gax.take() } else { None };
+        let mut rdrv = if self.tap_channels { self.rdrv.take() } else { None };
         while self.audio_cursor <= until {
+            #[cfg(feature = "perf-counters")]
+            {
+                self.perf_counters.pump_muestras += 1;
+            }
             // Mix Direct Sound DAC levels with the PSG channels into a
             // stereo pair, honoring the SOUNDCNT routing the hardware
             // applies: per-side FIFO enables and the 50%/100% volume
@@ -554,13 +693,15 @@ impl MemMap {
             }
             self.audio_cursor += AUDIO_SAMPLE_CYCLES;
         }
-        self.mp2k = mp2k;
-        self.gax = gax;
-        self.rdrv = rdrv;
+        if self.tap_channels { self.mp2k = mp2k; }
+        if self.tap_channels { self.gax = gax; }
+        if self.tap_channels { self.rdrv = rdrv; }
 
         #[cfg(feature = "perf-counters")]
         {
-            self.perf_counters.apu_ns += t_start.elapsed().as_nanos() as u64;
+            if let Some(t) = t_start {
+                self.perf_counters.apu_ns += crate::perf_clock::ns_since(t);
+            }
         }
     }
 
@@ -568,6 +709,7 @@ impl MemMap {
     /// the shadow's hook keys. `r0` is the guest's first argument
     /// register (the v3 mixer receives its arg block there).
     pub fn gax_frame_hook(&mut self, key: u32, r0: u32) {
+        self.pump_audio(self.clock);
         if let Some(mut g) = self.gax.take() {
             let mem = crate::mp2k::MemView {
                 rom: &self.rom,
@@ -582,6 +724,7 @@ impl MemMap {
     /// In-house (R) HLE hook: dispatch loops call this when PC lands
     /// on the shadow's mix or advance entries.
     pub fn rdrv_frame_hook(&mut self, key: u32) {
+        self.pump_audio(self.clock);
         if let Some(mut rr) = self.rdrv.take() {
             let mem = crate::mp2k::MemView {
                 rom: &self.rom,
@@ -596,6 +739,7 @@ impl MemMap {
     /// MP2K HLE per-tick hook: the dispatch loops call this when PC
     /// lands on the detected SoundMainRAM entry.
     pub fn mp2k_frame_hook(&mut self, key: u32) {
+        self.pump_audio(self.clock);
         if let Some(mut h) = self.mp2k.take() {
             let mem = crate::mp2k::MemView {
                 rom: &self.rom,
@@ -611,11 +755,8 @@ impl MemMap {
     pub fn skip_to_next_event(&mut self) {
         self.clock = self.clock.max(self.next_event);
         while self.clock >= self.next_event {
-            let ev = self.next_event;
-            self.pump_audio(ev);
             self.process_events();
         }
-        self.pump_audio(self.clock);
     }
 
     fn video_due(&self) -> u64 {
@@ -644,6 +785,64 @@ impl MemMap {
         self.next_event = next;
     }
 
+    /// Cuenta si la línea visible `line` tiene registros de vídeo distintos de la
+    /// línea anterior. La línea 0 solo actualiza la copia: su anterior es del cuadro previo.
+    #[cfg(feature = "perf-video")]
+    fn cuenta_cambio_de_linea(&mut self, line: usize) {
+        if line > 0
+            && (self.copia_linea_io[..] != self.io[..0x60]
+                || self.copia_linea_paleta[..] != self.palette[..])
+        {
+            self.perf_counters.lineas_con_cambio += 1;
+            self.perf_counters.mascara_lineas[line / 64] |= 1u64 << (line % 64);
+        }
+        self.copia_linea_io.copy_from_slice(&self.io[..0x60]);
+        self.copia_linea_paleta.copy_from_slice(&self.palette);
+        if line > 0 && self.copia_linea_vram[..] != self.vram[..] {
+            self.perf_counters.lineas_vram_cambio += 1;
+            self.perf_counters.mascara_vram[line / 64] |= 1u64 << (line % 64);
+        }
+        if line > 0 && self.copia_linea_oam[..] != self.oam[..] {
+            self.perf_counters.lineas_oam_cambio += 1;
+            self.perf_counters.mascara_oam[line / 64] |= 1u64 << (line % 64);
+        }
+        self.copia_linea_vram.copy_from_slice(&self.vram);
+        self.copia_linea_oam.copy_from_slice(&self.oam);
+    }
+
+    /// Avanza los acumuladores de referencia afín (BG2X/BG2Y y BG3X/BG3Y) por scanline.
+    /// Reproduce exactamente la aritmética de ppu::render_scanline para mantener sincronizada
+    /// la geometría afín del hardware GBA cuando la PPU por software está omitida.
+    fn step_affine_accumulators(&mut self, line: usize) {
+        let dispcnt = u16::from_le_bytes([self.io[0], self.io[1]]);
+        if dispcnt & 0x80 != 0 {
+            return; // Forced blank
+        }
+        let sign_extend28 = |v: u32| -> i32 {
+            ((v << 4) as i32) >> 4
+        };
+        let read_io32 = |mem: &MemMap, off: usize| -> u32 {
+            u32::from_le_bytes([mem.io[off], mem.io[off + 1], mem.io[off + 2], mem.io[off + 3]])
+        };
+        let io16 = |mem: &MemMap, off: usize| -> u16 {
+            u16::from_le_bytes([mem.io[off], mem.io[off + 1]])
+        };
+        if line == 0 || self.aff_dirty[0] {
+            self.aff_ref[0] = sign_extend28(read_io32(self, 0x28));
+            self.aff_ref[1] = sign_extend28(read_io32(self, 0x2C));
+            self.aff_dirty[0] = false;
+        }
+        if line == 0 || self.aff_dirty[1] {
+            self.aff_ref[2] = sign_extend28(read_io32(self, 0x38));
+            self.aff_ref[3] = sign_extend28(read_io32(self, 0x3C));
+            self.aff_dirty[1] = false;
+        }
+        self.aff_ref[0] = self.aff_ref[0].wrapping_add(io16(self, 0x22) as i16 as i32);
+        self.aff_ref[1] = self.aff_ref[1].wrapping_add(io16(self, 0x26) as i16 as i32);
+        self.aff_ref[2] = self.aff_ref[2].wrapping_add(io16(self, 0x32) as i16 as i32);
+        self.aff_ref[3] = self.aff_ref[3].wrapping_add(io16(self, 0x36) as i16 as i32);
+    }
+
     fn process_video_event(&mut self) {
         match self.vphase {
             VPhase::Hblank => {
@@ -653,7 +852,30 @@ impl MemMap {
                     // same four parts it reports separately. Wrapping the call
                     // in another clock read cost a second timestamp per line
                     // for a total that was already the sum of those parts.
-                    crate::ppu::render_scanline(self, line as usize);
+                    #[cfg(feature = "perf-video")]
+                    self.cuenta_cambio_de_linea(line as usize);
+                    #[cfg(feature = "perf-video")]
+                    if self.capturar_linea {
+                        self.capturas_linea.push(CapturaLinea {
+                            linea: line as usize,
+                            io: self.io.clone(),
+                            palette: self.palette.clone(),
+                            vram: self.vram.clone(),
+                            oam: self.oam.clone(),
+                            aff_ref: self.aff_ref,
+                            aff_dirty: self.aff_dirty,
+                        });
+                    }
+                    if self.capturar_lut_ligera {
+                        let l = line as usize;
+                        self.io_lineas[l].copy_from_slice(&self.io[..0x60]);
+                        self.paleta_lineas[l].copy_from_slice(&self.palette[..1024]);
+                    }
+                    if self.omitir_ppu_software {
+                        self.step_affine_accumulators(line as usize);
+                    } else {
+                        crate::ppu::render_scanline(self, line as usize);
+                    }
                     self.trigger_dma(2); // HBlank timing (visible lines only)
                 }
                 if self.io[(DISPSTAT & 0x3FF) as usize] & 0x10 != 0 {
@@ -678,6 +900,7 @@ impl MemMap {
                         self.raise_irq(irq::VBLANK);
                     }
                     self.trigger_dma(1); // VBlank timing
+                    self.pump_audio(self.clock);
                 }
             }
         }
@@ -741,6 +964,9 @@ impl MemMap {
                 let past = total - 0x1_0000;
                 let overflows = 1 + past / period;
                 self.timers[i].count = (t.reload as u64 + past % period) as u16;
+                if i < 2 {
+                    self.pump_audio(t.last_sync + ((0x1_0000 - t.count as u64) << shift));
+                }
                 self.timer_overflowed(i, overflows);
             }
         }
@@ -916,7 +1142,6 @@ impl MemMap {
             if !sound_mode && done % 16 == 0 {
                 self.clock += 32;
                 self.advance_timers();
-                self.pump_audio(self.clock);
             }
         }
 
@@ -971,6 +1196,11 @@ impl MemMap {
 
     /// Route an I/O-register byte write to the owning peripheral.
     fn io_write8(&mut self, off: u32, value: u8) {
+        // Audio state changes (PSG, SOUNDCNT, FIFO, timers, DMA): bring the
+        // sample grid up to now first, so samples keep the old state.
+        if (0x60..0xE0).contains(&off) || (0x100..0x110).contains(&off) {
+            self.pump_audio(self.clock);
+        }
         // Diagnostic (RECOMP_TRACE_IOW): scroll/blend register write
         // timing, for scanline-effect divergence between dispatch paths.
         {
@@ -1097,6 +1327,7 @@ impl MemMap {
             // SOUNDCNT_X: bits 0-3 read back live PSG channel-active
             // flags; with the master enable off everything reads clear.
             0x0400_0084 => {
+                self.pump_audio(self.clock);
                 let master = self.io[0x84] & 0x80;
                 if master == 0 {
                     0
@@ -1252,6 +1483,15 @@ impl Bus for MemMap {
         #[cfg(feature = "perf-counters")]
         {
             self.perf_counters.writes += 1;
+        }
+        #[cfg(feature = "perf-video")]
+        {
+            if matches!(addr >> 24, 0x04..=0x07) {
+                self.perf_counters.escrituras_video += 1;
+                if addr >> 24 == 0x04 {
+                    self.perf_counters.escrituras_es += 1;
+                }
+            }
         }
         match addr >> 24 {
             0x02 => self.ewram[(addr & 0x3_FFFF) as usize] = value,
@@ -1449,6 +1689,15 @@ impl Bus for MemMap {
         {
             self.perf_counters.writes += 1;
         }
+        #[cfg(feature = "perf-video")]
+        {
+            if matches!(addr >> 24, 0x04..=0x07) {
+                self.perf_counters.escrituras_video += 1;
+                if addr >> 24 == 0x04 {
+                    self.perf_counters.escrituras_es += 1;
+                }
+            }
+        }
         // Bypass the byte-write quirks for naturally sized accesses.
         match addr >> 24 {
             0x02 => {
@@ -1492,6 +1741,15 @@ impl Bus for MemMap {
         #[cfg(feature = "perf-counters")]
         {
             self.perf_counters.writes += 1;
+        }
+        #[cfg(feature = "perf-video")]
+        {
+            if matches!(addr >> 24, 0x04..=0x07) {
+                self.perf_counters.escrituras_video += 1;
+                if addr >> 24 == 0x04 {
+                    self.perf_counters.escrituras_es += 1;
+                }
+            }
         }
         let a = addr & !1;
         match a >> 24 {

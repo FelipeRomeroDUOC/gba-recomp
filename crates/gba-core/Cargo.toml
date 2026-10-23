@@ -20,3 +20,4 @@ windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_
 [features]
 default = []
 perf-counters = []
+perf-video = ["perf-counters"]

@@ -249,11 +249,12 @@ impl Apu {
     pub fn sample(&mut self, io: &[u8], wave_playing: &[u8; 16], cycles: u32) -> (i16, i16) {
         // 64 Hz frame count since last sample (almost always 0 or 1).
         self.frame_acc += cycles;
-        let frames64 = self.frame_acc / 262144;
-        self.frame_acc %= 262144;
+        let frames64 = self.frame_acc >> 18;
+        self.frame_acc &= 0x3_FFFF;
 
         // Per-channel outputs (state always advances, even when a
         // channel is routed to neither side).
+        if self.active() == 0 { return (0, 0); }
         let mut ch: [i32; 4] = [0; 4];
         ch[0] = self.sq[0].sample(cycles, frames64) as i32;
         ch[1] = self.sq[1].sample(cycles, frames64) as i32;

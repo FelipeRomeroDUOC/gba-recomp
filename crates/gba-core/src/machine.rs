@@ -124,7 +124,7 @@ impl Machine {
         } else {
             exec::step_hle_cached(&mut self.cpu, &mut self.bus, &mut self.decode_cache)
         };
-        self.bus.tick(instr_cost(region, &instr));
+        self.bus.tick_fast(instr_cost(region, &instr));
         StepEvent::Instr(instr)
     }
 
@@ -149,7 +149,7 @@ impl Machine {
             .enter_exception(crate::cpu::Exception::Irq, return_lr);
         let target = self.cpu.branch.take().unwrap_or(0x18);
         self.cpu.regs[15] = target & !3;
-        self.bus.tick(3); // exception entry (2S + 1N)
+        self.bus.tick_fast(3); // exception entry (2S + 1N)
     }
 
     /// Run until the next completed frame (or a step budget runs out).
@@ -209,7 +209,7 @@ impl Machine {
         self.bus.bios_open = 0xE25E_F004; // BIOS protection: during IRQ
         let handler = self.bus.read32(HANDLER_PTR);
         self.cpu.regs[15] = handler & !3;
-        self.bus.tick(24); // rough dispatch cost
+        self.bus.tick_fast(24); // rough dispatch cost
     }
 
     /// HLE of the BIOS IRQ dispatcher epilogue:
@@ -234,7 +234,7 @@ impl Machine {
         let mask = if cpu.thumb() { !1u32 } else { !3u32 };
         cpu.regs[15] = target & mask;
         self.bus.bios_open = 0xE55E_C002; // BIOS protection: after IRQ
-        self.bus.tick(16);
+        self.bus.tick_fast(16);
     }
 }
 
