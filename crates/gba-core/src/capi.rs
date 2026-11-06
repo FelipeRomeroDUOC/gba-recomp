@@ -54,9 +54,12 @@ macro_rules! mach {
 
 extern "C" fn rt_chain_gate(m: *mut core::ffi::c_void) -> u32 {
     let mach = mach!(m);
+    let scanline = mach.bus.scanline();
+    let raster_irq_habilitado = (mach.bus.io[0x04] & 0x30) != 0 && mach.bus.ime;
     (mach.bus.frame_ready
         || mach.bus.halted
-        || (mach.bus.irq_pending() && mach.cpu.cpsr & crate::cpu::FLAG_I == 0)) as u32
+        || (mach.bus.irq_pending() && mach.cpu.cpsr & crate::cpu::FLAG_I == 0)
+        || (raster_irq_habilitado && (scanline < 160 || scanline >= 227))) as u32
 }
 
 extern "C" fn rt_read8(m: *mut core::ffi::c_void, a: u32) -> u32 {
@@ -69,16 +72,31 @@ extern "C" fn rt_read32(m: *mut core::ffi::c_void, a: u32) -> u32 {
     crate::Bus::read32(&mut mach!(m).bus, a)
 }
 extern "C" fn rt_write8(m: *mut core::ffi::c_void, a: u32, v: u32) {
-    crate::Bus::write8(&mut mach!(m).bus, a, v as u8)
+    let bus = &mut mach!(m).bus;
+    if (0x0400_0000..=0x0400_0056).contains(&a) && !bus.halted {
+        bus.tick_fast(0);
+    }
+    crate::Bus::write8(bus, a, v as u8)
 }
 extern "C" fn rt_write16(m: *mut core::ffi::c_void, a: u32, v: u32) {
-    crate::Bus::write16(&mut mach!(m).bus, a, v as u16)
+    let bus = &mut mach!(m).bus;
+    if (0x0400_0000..=0x0400_0056).contains(&a) && !bus.halted {
+        bus.tick_fast(0);
+    }
+    crate::Bus::write16(bus, a, v as u16)
 }
 extern "C" fn rt_write32(m: *mut core::ffi::c_void, a: u32, v: u32) {
-    crate::Bus::write32(&mut mach!(m).bus, a, v)
+    let bus = &mut mach!(m).bus;
+    if (0x0400_0000..=0x0400_0056).contains(&a) && !bus.halted {
+        bus.tick_fast(0);
+    }
+    crate::Bus::write32(bus, a, v)
 }
 extern "C" fn rt_tick(m: *mut core::ffi::c_void, cycles: u32) {
-    mach!(m).bus.tick_fast(cycles as u64)
+    let mach = mach!(m);
+    if !mach.bus.halted {
+        mach.bus.tick_fast(cycles as u64);
+    }
 }
 
 extern "C" fn rt_guard(m: *mut core::ffi::c_void, addr: u32, len: u32, expect: u64) -> u32 {
@@ -115,13 +133,18 @@ pub struct RcgBlock {
 
 pub extern "C" fn rt_interp_one(m: *mut core::ffi::c_void) -> u32 {
     let m = unsafe { &mut *(m as *mut Machine) };
+    if m.bus.halted || (m.bus.irq_pending() && m.cpu.cpsr & crate::cpu::FLAG_I == 0) {
+        return m.cpu.regs[15] | m.cpu.thumb() as u32;
+    }
     let region = (m.cpu.regs[15] >> 24) as usize & 0xF;
     let instr = if m.bus.real_bios {
         exec::step_cached(&mut m.cpu, &mut m.bus, &mut m.decode_cache)
     } else {
         exec::step_hle_cached(&mut m.cpu, &mut m.bus, &mut m.decode_cache)
     };
-    m.bus.tick_fast(crate::machine::instr_cost(region, &instr));
+    if !m.bus.halted {
+        m.bus.tick_fast(crate::machine::instr_cost(region, &instr));
+    }
     m.cpu.regs[15] | m.cpu.thumb() as u32
 }
 

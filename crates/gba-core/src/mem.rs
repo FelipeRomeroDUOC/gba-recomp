@@ -150,7 +150,7 @@ pub struct MemMap {
     dma: [Dma; 4],
 
     // Video event tracking.
-    vline_start: u64,
+    pub vline_start: u64,
     vphase: VPhase,
     /// Set when a frame completes (start of VBlank); cleared by the runner.
     pub frame_ready: bool,
